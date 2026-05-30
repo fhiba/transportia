@@ -211,3 +211,13 @@ __marimo__/
 # Collected data and logs
 data/
 collector.log
+
+# Pipeline outputs (regenerable from scripts)
+outputs/
+
+# OSM cached graph
+*.graphml
+
+# OS
+.DS_Store
+Thumbs.db
