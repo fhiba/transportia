@@ -75,6 +75,34 @@ def compute_unique_segment_features(seg: pd.DataFrame, semaforos: pd.DataFrame) 
     return unique
 
 
+CABA_LAT = (-34.75, -34.50)
+CABA_LON = (-58.65, -58.30)
+MAX_ROUTES = 200
+
+
+def filter_caba_routes(seg: pd.DataFrame, max_routes: int = MAX_ROUTES) -> pd.DataFrame:
+    if "stop_A_lat" not in seg.columns or "route_short_name" not in seg.columns:
+        log.warning("Missing stop_A_lat or route_short_name — skipping route filter")
+        return seg
+    route_centroids = seg.dropna(subset=["stop_A_lat", "stop_A_lon"]).groupby("route_short_name").agg(
+        centroid_lat=("stop_A_lat", "mean"),
+        centroid_lon=("stop_A_lon", "mean"),
+        n_obs=("travel_time_observed", "count"),
+    )
+    in_caba = route_centroids[
+        route_centroids["centroid_lat"].between(*CABA_LAT)
+        & route_centroids["centroid_lon"].between(*CABA_LON)
+    ]
+    if in_caba.empty:
+        log.warning("No routes found in CABA bounds — using all routes")
+        return seg
+    top_routes = in_caba.sort_values("n_obs", ascending=False).head(max_routes).index
+    n_before = len(seg)
+    seg = seg[seg["route_short_name"].isin(top_routes)].copy()
+    log.info("Filtered to %d CABA routes (top %d by observations): %d → %d rows", len(top_routes), max_routes, n_before, len(seg))
+    return seg
+
+
 def main():
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,10 +117,18 @@ def main():
     seg = pd.read_parquet(seg_path)
     log.info("Loaded %d segment observations", len(seg))
 
+    log.info("Filtering to ~%d CABA routes...", MAX_ROUTES)
+    seg = filter_caba_routes(seg)
+
     hw = None
     if hw_path.exists():
         hw = pd.read_parquet(hw_path)
         log.info("Loaded %d headway observations", len(hw))
+        if hw is not None and "route_short_name" in hw.columns:
+            valid_routes = set(seg["route_short_name"].unique())
+            n_hw_before = len(hw)
+            hw = hw[hw["route_short_name"].isin(valid_routes)].copy()
+            log.info("Filtered headway to same routes: %d → %d", n_hw_before, len(hw))
 
     log.info("Computing unique segment features (distance, semaphores)...")
     semaforos = load_semaforos()
@@ -115,15 +151,9 @@ def main():
     else:
         seg["day_type"] = "weekday"
 
-    log.info("Computing avg_speed_zone_hour (mean travel_time per zone/hour)...")
-    speed_map = seg.groupby(["zone_lat", "zone_lon", "hour_bin"])["travel_time_observed"].mean()
-    seg["avg_speed_zone_hour"] = seg.set_index(["zone_lat", "zone_lon", "hour_bin"]).index.map(
-        speed_map.get
-    )
-
     n_before = len(seg)
-    seg = seg[(seg["travel_time_observed"] >= 5) & (seg["travel_time_observed"] <= 900)]
-    log.info("Filtered travel_time outliers (>900s = GPS artifacts/breaks): %d → %d (removed %d)", n_before, len(seg), n_before - len(seg))
+    seg = seg[(seg["travel_time_observed"] >= 5) & (seg["travel_time_observed"] <= 600)]
+    log.info("Filtered travel_time outliers (>600s): %d → %d (removed %d)", n_before, len(seg), n_before - len(seg))
 
     out_seg = OUTPUTS_DIR / "segments_features.parquet"
     seg.to_parquet(out_seg, index=False)
@@ -190,8 +220,8 @@ def main():
                     log.info("Headway programado matched: %d / %d rows", hw["headway_programado"].notna().sum(), len(hw))
 
         n_before_hw = len(hw)
-        hw = hw[(hw["headway_observed"] >= 30) & (hw["headway_observed"] <= 7200)]
-        log.info("Filtered headway outliers: %d → %d", n_before_hw, len(hw))
+        hw = hw[(hw["headway_observed"] >= 30) & (hw["headway_observed"] <= 900)]
+        log.info("Filtered headway outliers (>900s): %d → %d", n_before_hw, len(hw))
 
         out_hw = OUTPUTS_DIR / "headway_features.parquet"
         hw.to_parquet(out_hw, index=False)
@@ -203,8 +233,7 @@ def main():
     print("=" * 60)
 
     feature_cols = ["distance_m", "zone_lat", "zone_lon", "hour_bin", "day_type",
-                    "n_semaphores", "pct_semaphores_operational", "segment_curvature",
-                    "avg_speed_zone_hour"]
+                    "n_semaphores", "pct_semaphores_operational"]
     existing = [c for c in feature_cols if c in seg.columns]
 
     print("\n--- Segment Features ---")

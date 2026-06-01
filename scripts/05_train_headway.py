@@ -32,6 +32,11 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
         df["day_type_enc"] = df["day_type"].map(day_map).fillna(0)
     else:
         df["day_type_enc"] = 0
+    if "route_short_name" in df.columns:
+        freq = df["route_short_name"].value_counts()
+        df["route_enc"] = df["route_short_name"].map(freq).fillna(0).astype(int)
+    else:
+        df["route_enc"] = 0
     return df
 
 
@@ -49,7 +54,10 @@ def main():
 
     df = encode_categoricals(df)
 
-    feature_candidates = ["stop_lat", "stop_lon", "hour_bin_enc", "day_type_enc", "n_vehicles_active", "headway_programado"]
+    feature_candidates = [
+        "stop_lat", "stop_lon", "hour_bin_enc", "day_type_enc",
+        "n_vehicles_active", "headway_programado", "route_enc",
+    ]
     existing_features = [c for c in feature_candidates if c in df.columns]
 
     df_model = df.dropna(subset=existing_features + ["headway_observed"]).copy()
@@ -87,8 +95,11 @@ def main():
 
     log.info("Train: %d | Test: %d", len(X_train), len(X_test))
 
-    log.info("Training Random Forest...")
-    rf_params = {"n_estimators": [100], "max_depth": [20]}
+    log.info("Training Random Forest with GridSearch...")
+    rf_params = {
+        "n_estimators": [100, 200, 300],
+        "max_depth": [10, 20, 30, None],
+    }
     rf_model = GridSearchCV(
         RandomForestRegressor(random_state=42, n_jobs=-1),
         rf_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=-1, verbose=1,
@@ -96,8 +107,12 @@ def main():
     rf_model.fit(X_train, y_train)
     log.info("RF best params: %s", rf_model.best_params_)
 
-    log.info("Training GradientBoosting...")
-    gb_params = {"n_estimators": [100], "max_depth": [4], "learning_rate": [0.1]}
+    log.info("Training GradientBoosting with GridSearch...")
+    gb_params = {
+        "n_estimators": [100, 200, 300],
+        "max_depth": [3, 5, 7],
+        "learning_rate": [0.05, 0.1],
+    }
     gb_model = GridSearchCV(
         GradientBoostingRegressor(random_state=42),
         gb_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=-1, verbose=1,
@@ -129,21 +144,20 @@ def main():
         log.info("%(model)s: MAE=%(MAE).1f  RMSE=%(RMSE).1f  R2=%(R2).3f", r)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    rf_imp = rf_model.best_estimator_.feature_importances_
-    order_rf = np.argsort(rf_imp)[::-1][:15]
-    axes[0].barh(range(len(order_rf)), rf_imp[order_rf])
-    axes[0].set_yticks(range(len(order_rf)))
-    axes[0].set_yticklabels([existing_features[i] for i in order_rf])
-    axes[0].set_title("Random Forest Feature Importance")
-    axes[0].invert_yaxis()
 
-    gb_imp = gb_model.best_estimator_.feature_importances_
-    order_gb = np.argsort(gb_imp)[::-1][:15]
-    axes[1].barh(range(len(order_gb)), gb_imp[order_gb])
-    axes[1].set_yticks(range(len(order_gb)))
-    axes[1].set_yticklabels([existing_features[i] for i in order_gb])
-    axes[1].set_title("GradientBoosting Feature Importance")
-    axes[1].invert_yaxis()
+    for ax, model_obj, title_prefix in [
+        (axes[0], rf_model, "Random Forest"),
+        (axes[1], gb_model, "GradientBoosting"),
+    ]:
+        imp = model_obj.best_estimator_.feature_importances_
+        order = np.argsort(imp)[::-1][:15]
+        ax.barh(range(len(order)), imp[order])
+        ax.set_yticks(range(len(order)))
+        ax.set_yticklabels([existing_features[i] for i in order])
+        ax.set_title(f"{title_prefix} Feature Importance")
+        ax.invert_yaxis()
+        ax.grid(True, alpha=0.3, color="gray", linestyle="--")
+
     plt.tight_layout()
 
     fig_path = OUTPUTS_DIR / "feature_importance_headway.png"
@@ -172,6 +186,9 @@ def main():
     for r in results:
         print(f"{r['model']:<20} {r['MAE']:>10.1f} {r['RMSE']:>10.1f} {r['R2']:>10.3f}")
     print(f"\nBest model: {best_name}")
+    imp = best_model.feature_importances_
+    top_idx = np.argsort(imp)[::-1][:5]
+    print(f"Top features: {[existing_features[i] for i in top_idx]}")
     print("=" * 60)
     print("\n>>> Review metrics above. If OK, proceed to script 06.")
 

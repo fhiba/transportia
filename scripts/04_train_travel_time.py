@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
@@ -22,9 +22,8 @@ log = logging.getLogger(__name__)
 
 FEATURE_COLS = [
     "distance_m", "zone_lat", "zone_lon", "hour_bin",
-    "day_type", "avg_speed_zone_hour",
+    "day_type", "route_enc",
     "n_semaphores", "pct_semaphores_operational",
-    "segment_curvature",
 ]
 
 
@@ -36,6 +35,11 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     if "day_type" in df.columns:
         day_map = {"weekday": 0, "weekend": 1}
         df["day_type"] = df["day_type"].map(day_map).fillna(0)
+    if "route_short_name" in df.columns:
+        freq = df["route_short_name"].value_counts()
+        df["route_enc"] = df["route_short_name"].map(freq).fillna(0).astype(int)
+    else:
+        df["route_enc"] = 0
     return df
 
 
@@ -90,8 +94,7 @@ def main():
 
     log.info("Train: %d | Test: %d", len(X_train), len(X_test))
 
-    # XGBoost
-    log.info("Training XGBoost...")
+    log.info("Training XGBoost with GridSearch...")
     xgb_params = {
         "n_estimators": [100, 200],
         "max_depth": [4, 6, 8],
@@ -108,11 +111,11 @@ def main():
     xgb_model.fit(X_train, y_train)
     log.info("XGB best params: %s", xgb_model.best_params_)
 
-    # Random Forest
-    log.info("Training Random Forest...")
+    log.info("Training Random Forest with GridSearch...")
     rf_params = {
-        "n_estimators": [100],
-        "max_depth": [20],
+        "n_estimators": [100, 200, 300],
+        "max_depth": [10, 20, 30, None],
+        "min_samples_leaf": [1, 5],
     }
     rf_model = GridSearchCV(
         RandomForestRegressor(random_state=42, n_jobs=-1),
@@ -125,7 +128,6 @@ def main():
     rf_model.fit(X_train, y_train)
     log.info("RF best params: %s", rf_model.best_params_)
 
-    # Predictions
     pred_xgb = xgb_model.best_estimator_.predict(X_test)
     pred_rf = rf_model.best_estimator_.predict(X_test)
 
@@ -155,26 +157,20 @@ def main():
     for r in results:
         log.info("%(model)s: MAE=%(MAE).1f  RMSE=%(RMSE).1f  R2=%(R2).3f", r)
 
-    # Feature importance
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    xgb_imp = xgb_model.best_estimator_.feature_importances_
-    order = np.argsort(xgb_imp)[::-1][:15]
-    axes[0].barh(range(len(order)), xgb_imp[order])
-    axes[0].set_yticks(range(len(order)))
-    feat_names = [existing_features[i] for i in order]
-    axes[0].set_yticklabels(feat_names)
-    axes[0].set_title("XGBoost Feature Importance")
-    axes[0].invert_yaxis()
-
-    rf_imp = rf_model.best_estimator_.feature_importances_
-    order_rf = np.argsort(rf_imp)[::-1][:15]
-    axes[1].barh(range(len(order_rf)), rf_imp[order_rf])
-    axes[1].set_yticks(range(len(order_rf)))
-    feat_names_rf = [existing_features[i] for i in order_rf]
-    axes[1].set_yticklabels(feat_names_rf)
-    axes[1].set_title("Random Forest Feature Importance")
-    axes[1].invert_yaxis()
+    for ax, model_obj, title_prefix in [
+        (axes[0], xgb_model, "XGBoost"),
+        (axes[1], rf_model, "Random Forest"),
+    ]:
+        imp = model_obj.best_estimator_.feature_importances_
+        order = np.argsort(imp)[::-1][:15]
+        ax.barh(range(len(order)), imp[order])
+        ax.set_yticks(range(len(order)))
+        ax.set_yticklabels([existing_features[i] for i in order])
+        ax.set_title(f"{title_prefix} Feature Importance")
+        ax.invert_yaxis()
+        ax.grid(True, alpha=0.3, color="gray", linestyle="--")
 
     plt.tight_layout()
     fig_path = OUTPUTS_DIR / "feature_importance_travel_time.png"
@@ -182,7 +178,6 @@ def main():
     plt.close()
     log.info("Saved %s", fig_path)
 
-    # Select best model
     best_idx = np.argmin([r["RMSE"] for r in results[:2]])
     best_model = xgb_model.best_estimator_ if best_idx == 0 else rf_model.best_estimator_
     best_name = results[best_idx]["model"]
@@ -196,7 +191,6 @@ def main():
         json.dump({"results": results, "best_model": best_name, "features": existing_features}, f, indent=2)
     log.info("Saved %s", metrics_path)
 
-    # CHECKPOINT
     print("\n" + "=" * 60)
     print("CHECKPOINT — Travel Time Model")
     print("=" * 60)
@@ -205,7 +199,9 @@ def main():
     for r in results:
         print(f"{r['model']:<20} {r['MAE']:>10.1f} {r['RMSE']:>10.1f} {r['R2']:>10.3f}")
     print(f"\nBest model: {best_name}")
-    print(f"Top features: {feat_names[:5]}")
+    imp = best_model.feature_importances_
+    top_idx = np.argsort(imp)[::-1][:5]
+    print(f"Top features: {[existing_features[i] for i in top_idx]}")
     print("=" * 60)
     print("\n>>> Review metrics above. If OK, proceed to script 05.")
 
