@@ -52,11 +52,16 @@ def main():
     df = pd.read_parquet(hw_path)
     log.info("Loaded %d rows", len(df))
 
+    if "day_type" not in df.columns:
+        df["day_type"] = pd.to_datetime(df["arrival_ts"]).dt.dayofweek.apply(
+            lambda d: "weekend" if d >= 5 else "weekday"
+        )
+
     df = encode_categoricals(df)
 
     feature_candidates = [
         "stop_lat", "stop_lon", "hour_bin_enc", "day_type_enc",
-        "n_vehicles_active", "headway_programado", "route_enc",
+        "n_vehicles_active", "headway_programado",
     ]
     existing_features = [c for c in feature_candidates if c in df.columns]
 
@@ -102,7 +107,7 @@ def main():
     }
     rf_model = GridSearchCV(
         RandomForestRegressor(random_state=42, n_jobs=-1),
-        rf_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=-1, verbose=1,
+        rf_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=1, verbose=1,
     )
     rf_model.fit(X_train, y_train)
     log.info("RF best params: %s", rf_model.best_params_)
@@ -115,7 +120,7 @@ def main():
     }
     gb_model = GridSearchCV(
         GradientBoostingRegressor(random_state=42),
-        gb_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=-1, verbose=1,
+        gb_params, cv=3, scoring="neg_root_mean_squared_error", n_jobs=1, verbose=1,
     )
     gb_model.fit(X_train, y_train)
     log.info("GB best params: %s", gb_model.best_params_)
@@ -170,7 +175,15 @@ def main():
     best_name = results[best_idx]["model"]
 
     model_path = OUTPUTS_DIR / "model_headway.joblib"
-    joblib.dump({"model": best_model, "features": existing_features, "model_name": best_name}, model_path)
+    joblib.dump({
+        "model": best_model,
+        "features": existing_features,
+        "model_name": best_name,
+        "cv_results_rf": rf_model.cv_results_,
+        "best_params_rf": rf_model.best_params_,
+        "cv_results_gb": gb_model.cv_results_,
+        "best_params_gb": gb_model.best_params_,
+    }, model_path)
     log.info("Saved %s (best: %s)", model_path, best_name)
 
     metrics_path = OUTPUTS_DIR / "metrics_headway.json"

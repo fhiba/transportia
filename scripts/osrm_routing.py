@@ -7,6 +7,7 @@ import requests
 log = logging.getLogger(__name__)
 
 DEFAULT_OSRM_URL = "http://localhost:5000"
+PUBLIC_OSRM_URL = "https://router.project-osrm.org"
 
 
 def get_route(
@@ -67,6 +68,35 @@ def get_route_duration_s(
     if route:
         return route["duration_s"]
     return None
+
+
+def get_route_waypoints(
+    coords: list,
+    osrm_url: str = DEFAULT_OSRM_URL,
+    timeout: float = 10.0,
+) -> Optional[dict]:
+    """Get a single route through multiple waypoints. coords = list of (lon, lat) tuples."""
+    if len(coords) < 2:
+        return None
+    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
+    url = f"{osrm_url}/route/v1/driving/{coords_str}"
+    params = {"overview": "full", "geometries": "geojson"}
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            return None
+        route = data["routes"][0]
+        geometry = route["geometry"]["coordinates"] if route.get("geometry") else []
+        return {
+            "distance_m": route["distance"],
+            "duration_s": route["duration"],
+            "geometry": geometry,
+        }
+    except (requests.RequestException, KeyError, IndexError) as e:
+        log.debug("OSRM waypoints route failed: %s", e)
+        return None
 
 
 def is_osrm_available(osrm_url: str = DEFAULT_OSRM_URL) -> bool:

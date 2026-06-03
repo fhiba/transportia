@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 FEATURE_COLS = [
     "distance_m", "zone_lat", "zone_lon", "hour_bin",
-    "day_type", "route_enc",
+    "day_type",
     "n_semaphores", "pct_semaphores_operational",
 ]
 
@@ -35,11 +35,8 @@ def encode_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     if "day_type" in df.columns:
         day_map = {"weekday": 0, "weekend": 1}
         df["day_type"] = df["day_type"].map(day_map).fillna(0)
-    if "route_short_name" in df.columns:
-        freq = df["route_short_name"].value_counts()
-        df["route_enc"] = df["route_short_name"].map(freq).fillna(0).astype(int)
-    else:
-        df["route_enc"] = 0
+    if "pct_semaphores_operational" in df.columns:
+        df["pct_semaphores_operational"] = df["pct_semaphores_operational"].fillna(0.0)
     return df
 
 
@@ -105,7 +102,7 @@ def main():
         xgb_params,
         cv=3,
         scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
+        n_jobs=1,
         verbose=1,
     )
     xgb_model.fit(X_train, y_train)
@@ -122,7 +119,7 @@ def main():
         rf_params,
         cv=3,
         scoring="neg_root_mean_squared_error",
-        n_jobs=-1,
+        n_jobs=1,
         verbose=1,
     )
     rf_model.fit(X_train, y_train)
@@ -183,7 +180,15 @@ def main():
     best_name = results[best_idx]["model"]
 
     model_path = OUTPUTS_DIR / "model_travel_time.joblib"
-    joblib.dump({"model": best_model, "features": existing_features, "model_name": best_name}, model_path)
+    joblib.dump({
+        "model": best_model,
+        "features": existing_features,
+        "model_name": best_name,
+        "cv_results_xgb": xgb_model.cv_results_,
+        "best_params_xgb": xgb_model.best_params_,
+        "cv_results_rf": rf_model.cv_results_,
+        "best_params_rf": rf_model.best_params_,
+    }, model_path)
     log.info("Saved %s (best: %s)", model_path, best_name)
 
     metrics_path = OUTPUTS_DIR / "metrics_travel_time.json"

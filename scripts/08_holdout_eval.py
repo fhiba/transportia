@@ -33,52 +33,59 @@ GPS_GTFS_MATCH_MIN = 0.50
 
 
 def build_gtfs_bbox() -> pd.DataFrame:
-    from utils import GTFS_DIR
-    dirs = sorted([p for p in GTFS_DIR.iterdir() if p.is_dir()])
-    if not dirs:
+    try:
+        from utils import GTFS_DIR
+        if not GTFS_DIR.exists():
+            log.warning("GTFS_DIR not found (%s) — skipping bbox validation", GTFS_DIR)
+            return pd.DataFrame()
+        dirs = sorted([p for p in GTFS_DIR.iterdir() if p.is_dir()])
+        if not dirs:
+            return pd.DataFrame()
+        gtfs_dir = dirs[-1]
+        log.info("Loading GTFS bbox from %s", gtfs_dir)
+
+        routes = pd.read_csv(gtfs_dir / "routes.txt", dtype=str)
+        trips = pd.read_csv(gtfs_dir / "trips.txt", dtype=str, low_memory=False)
+        routes["route_id"] = routes["route_id"].str.strip()
+        trips["route_id"] = trips["route_id"].str.strip()
+        trips["trip_id"] = trips["trip_id"].str.strip()
+
+        route_to_trip = trips.groupby("route_id")["trip_id"].first().to_dict()
+        routes_map = routes.set_index("route_id")["route_short_name"].to_dict()
+
+        trip_to_route = {}
+        for rid, tid in route_to_trip.items():
+            rsn = routes_map.get(rid)
+            if rsn:
+                trip_to_route[tid] = rsn
+
+        rep_trip_ids = set(trip_to_route.keys())
+        st_parts = []
+        for chunk in pd.read_csv(gtfs_dir / "stop_times.txt", dtype=str, low_memory=False, chunksize=500_000):
+            chunk["trip_id"] = chunk["trip_id"].str.strip()
+            st_parts.append(chunk[chunk["trip_id"].isin(rep_trip_ids)])
+        st = pd.concat(st_parts)
+
+        stops = pd.read_csv(gtfs_dir / "stops.txt", dtype=str)
+        stops["stop_id"] = stops["stop_id"].str.strip()
+        stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
+        stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
+        st = st.merge(stops[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
+        st = st.dropna(subset=["stop_lat", "stop_lon"])
+        st["route_short_name"] = st["trip_id"].map(trip_to_route)
+        st = st.dropna(subset=["route_short_name"])
+
+        bbox = st.groupby("route_short_name").agg(
+            gtfs_min_lat=("stop_lat", "min"),
+            gtfs_max_lat=("stop_lat", "max"),
+            gtfs_min_lon=("stop_lon", "min"),
+            gtfs_max_lon=("stop_lon", "max"),
+        ).reset_index()
+        log.info("GTFS bbox computed for %d routes", len(bbox))
+        return bbox
+    except (FileNotFoundError, OSError) as e:
+        log.warning("Could not load GTFS data (%s) — skipping bbox validation", e)
         return pd.DataFrame()
-    gtfs_dir = dirs[-1]
-    log.info("Loading GTFS bbox from %s", gtfs_dir)
-
-    routes = pd.read_csv(gtfs_dir / "routes.txt", dtype=str)
-    trips = pd.read_csv(gtfs_dir / "trips.txt", dtype=str, low_memory=False)
-    routes["route_id"] = routes["route_id"].str.strip()
-    trips["route_id"] = trips["route_id"].str.strip()
-    trips["trip_id"] = trips["trip_id"].str.strip()
-
-    route_to_trip = trips.groupby("route_id")["trip_id"].first().to_dict()
-    routes_map = routes.set_index("route_id")["route_short_name"].to_dict()
-
-    trip_to_route = {}
-    for rid, tid in route_to_trip.items():
-        rsn = routes_map.get(rid)
-        if rsn:
-            trip_to_route[tid] = rsn
-
-    rep_trip_ids = set(trip_to_route.keys())
-    st_parts = []
-    for chunk in pd.read_csv(gtfs_dir / "stop_times.txt", dtype=str, low_memory=False, chunksize=500_000):
-        chunk["trip_id"] = chunk["trip_id"].str.strip()
-        st_parts.append(chunk[chunk["trip_id"].isin(rep_trip_ids)])
-    st = pd.concat(st_parts)
-
-    stops = pd.read_csv(gtfs_dir / "stops.txt", dtype=str)
-    stops["stop_id"] = stops["stop_id"].str.strip()
-    stops["stop_lat"] = pd.to_numeric(stops["stop_lat"], errors="coerce")
-    stops["stop_lon"] = pd.to_numeric(stops["stop_lon"], errors="coerce")
-    st = st.merge(stops[["stop_id", "stop_lat", "stop_lon"]], on="stop_id", how="left")
-    st = st.dropna(subset=["stop_lat", "stop_lon"])
-    st["route_short_name"] = st["trip_id"].map(trip_to_route)
-    st = st.dropna(subset=["route_short_name"])
-
-    bbox = st.groupby("route_short_name").agg(
-        gtfs_min_lat=("stop_lat", "min"),
-        gtfs_max_lat=("stop_lat", "max"),
-        gtfs_min_lon=("stop_lon", "min"),
-        gtfs_max_lon=("stop_lon", "max"),
-    ).reset_index()
-    log.info("GTFS bbox computed for %d routes", len(bbox))
-    return bbox
 
 
 def select_holdout_routes(train_routes: set, sr: pd.DataFrame) -> list[str]:
@@ -87,17 +94,22 @@ def select_holdout_routes(train_routes: set, sr: pd.DataFrame) -> list[str]:
     ]
     route_obs = sr_amba.groupby("route_short_name").agg(
         n=("stop_A_lat", "count"),
-        centroid_lat=("stop_A_lat", "mean"),
-        centroid_lon=("stop_A_lon", "mean"),
     ).reset_index()
+
+    # Require 90%+ of observations within CABA bounds — guarantees semaphore coverage
+    caba_obs = sr_amba[
+        sr_amba["stop_A_lat"].between(*CABA_LAT) & sr_amba["stop_A_lon"].between(*CABA_LON)
+    ].groupby("route_short_name").size().rename("n_caba")
+    route_obs = route_obs.join(caba_obs, on="route_short_name", how="left")
+    route_obs["n_caba"] = route_obs["n_caba"].fillna(0)
+    route_obs["pct_caba"] = route_obs["n_caba"] / route_obs["n"]
 
     candidates = route_obs[
         (~route_obs["route_short_name"].isin(train_routes))
-        & (route_obs["centroid_lat"].between(*CABA_LAT))
-        & (route_obs["centroid_lon"].between(*CABA_LON))
+        & (route_obs["pct_caba"] >= 0.90)
         & (route_obs["n"] >= 50)
     ]
-    log.info("Holdout candidates (centroid CABA): %d routes", len(candidates))
+    log.info("Holdout candidates (>=90%% obs in CABA): %d routes", len(candidates))
 
     gtfs_bbox = build_gtfs_bbox()
     if gtfs_bbox.empty:
@@ -238,11 +250,6 @@ def encode_for_model(df: pd.DataFrame) -> pd.DataFrame:
         df["hour_bin"] = df["hour_bin"].map(hour_map).fillna(2)
     if "day_type" in df.columns:
         df["day_type"] = df["day_type"].map(day_map).fillna(0)
-    if "route_short_name" in df.columns:
-        freq = df["route_short_name"].value_counts()
-        df["route_enc"] = df["route_short_name"].map(freq).fillna(0).astype(int)
-    else:
-        df["route_enc"] = 0
     return df
 
 
@@ -251,6 +258,12 @@ def evaluate_holdout(holdout_df: pd.DataFrame, model_bundle: dict, train_metrics
     model = model_bundle["model"]
 
     holdout_df = encode_for_model(holdout_df)
+
+    if "pct_semaphores_operational" in holdout_df.columns:
+        holdout_df["pct_semaphores_operational"] = holdout_df["pct_semaphores_operational"].fillna(0.0)
+    if "n_semaphores" in holdout_df.columns:
+        holdout_df["n_semaphores"] = holdout_df["n_semaphores"].fillna(0)
+
     available = [c for c in features if c in holdout_df.columns]
     eval_df = holdout_df.dropna(subset=available + ["travel_time_observed"]).copy()
 
