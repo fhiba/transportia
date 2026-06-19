@@ -1,0 +1,95 @@
+{% extends "simulator/base.html" %}
+
+{% block content %}
+  <section class="intro">
+    <h1>SIMULADOR DE OPTIMIZACIÓN DE RUTAS</h1>
+    <p class="lead">Trabajo práctico — <strong>ITBA, Ciencia de Datos Aplicada</strong>.
+      Analizamos colectivos del AMBA/CABA cruzando <strong>GTFS</strong> (recorridos y paradas
+      oficiales) con <strong>tiempos de viaje observados por GPS</strong> para detectar dónde
+      cada línea pierde tiempo y proponer un trazado más eficiente.</p>
+
+    <div class="how">
+      <div class="how-step"><span class="how-n">1</span>
+        <p>Reconstruimos la secuencia de paradas de cada línea y medimos el tiempo
+          <em>real</em> entre paradas (mediana de viajes observados, sin modelos ML).</p></div>
+      <div class="how-step"><span class="how-n">2</span>
+        <p>Detectamos <strong>cuellos de botella</strong>: tramos cuyo tiempo de viaje supera
+          el percentil 85 de la propia línea.</p></div>
+      <div class="how-step"><span class="how-n">3</span>
+        <p>Sobre un grafo de paradas cercanas buscamos un <strong>recorrido alternativo</strong>
+          más rápido y estimamos el <strong>ahorro de tiempo</strong>.</p></div>
+    </div>
+
+    <p class="lead note">Acá listamos las líneas con <strong>≥90% del recorrido dentro de CABA</strong>.
+      Buscá una y abrila para ver en el mapa la ruta actual, las zonas congestionadas, las
+      paradas a eliminar/agregar y el recorrido propuesto.</p>
+  </section>
+
+  {% if not data_ready %}
+    <div class="alert">
+      <h2>FALTAN DATOS</h2>
+      <p>{{ load_error }}</p>
+      <p>Copiá <code>outputs/segments_features.parquet</code> y <code>outputs/route_scores.parquet</code>
+         y recargá esta página.</p>
+    </div>
+  {% elif not lines %}
+    <div class="alert">
+      <h2>SIN LÍNEAS</h2>
+      <p>No se encontraron líneas que cumplan el criterio de CABA.</p>
+    </div>
+  {% else %}
+    <div class="search">
+      <label for="line-search">BUSCAR LÍNEA</label>
+      <input id="line-search" type="search" autocomplete="off"
+             placeholder="Escribí el número o nombre de la línea…">
+      <span id="search-count" class="count">{{ lines|length }} líneas disponibles · ordenadas por potencial de mejora (peores primero)</span>
+    </div>
+
+    <div class="grid" id="lines-grid">
+      {% for l in lines %}
+        <a class="card" data-route="{{ l.route_short_name|lower }}" href="{% url 'line' l.route_short_name %}">
+          <div class="card-top">
+            <span class="route-name">{{ l.route_short_name }}</span>
+            <span class="badge">SCORE {{ l.efficiency_score|floatformat:0 }}</span>
+          </div>
+          <dl class="meta">
+            <div><dt>EN CABA</dt><dd>{{ l.pct_caba }}%</dd></div>
+            <div><dt>PARADAS</dt><dd>{{ l.n_stops }}</dd></div>
+          </dl>
+          <span class="cta">OPTIMIZAR →</span>
+        </a>
+      {% endfor %}
+    </div>
+    <p class="empty" id="no-results" hidden>Ninguna línea coincide con la búsqueda.</p>
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+  <script>
+    (function () {
+      var input = document.getElementById("line-search");
+      if (!input) return;
+      var cards = Array.prototype.slice.call(document.querySelectorAll("#lines-grid .card"));
+      var total = cards.length;
+      var countEl = document.getElementById("search-count");
+      var noResults = document.getElementById("no-results");
+      var baseCount = countEl ? countEl.textContent : "";
+
+      input.addEventListener("input", function () {
+        var q = input.value.trim().toLowerCase();
+        var shown = 0;
+        cards.forEach(function (c) {
+          var match = !q || c.getAttribute("data-route").indexOf(q) !== -1;
+          c.hidden = !match;
+          if (match) shown++;
+        });
+        if (noResults) noResults.hidden = shown !== 0;
+        if (countEl) {
+          countEl.textContent = q
+            ? shown + " de " + total + " líneas coinciden con “" + input.value.trim() + "”"
+            : baseCount;
+        }
+      });
+    })();
+  </script>
+{% endblock %}

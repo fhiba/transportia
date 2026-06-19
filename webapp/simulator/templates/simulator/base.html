@@ -1,0 +1,22 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}TRANSPORTIA · SIMULADOR{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'simulator/brutal.css' %}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">TRANSPORTIA<span class="brand-sep">·</span>SIMULADOR DE RUTAS</a>
+    <span class="brand-tag">AMBA / CABA — OPTIMIZACIÓN DE COLECTIVOS</span>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">ITBA — CIENCIA DE DATOS APLICADA · DATOS OBSERVADOS GPS + GTFS</footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

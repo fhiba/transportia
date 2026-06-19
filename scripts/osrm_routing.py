@@ -99,6 +99,50 @@ def get_route_waypoints(
         return None
 
 
+def match_route(
+    coords: list,
+    osrm_url: str = DEFAULT_OSRM_URL,
+    timeout: float = 10.0,
+    radius: float = 50.0,
+) -> Optional[dict]:
+    """Map-match a trace of (lon, lat) points to the road network.
+
+    Usa el servicio /match de OSRM en vez de /route. /route obliga a *pasar* por cada
+    waypoint, así que cuando dos paradas consecutivas caen sobre lados opuestos de una
+    avenida ancha (9 de Julio, Av. de Mayo) OSRM mete una vuelta a la manzana → se ven
+    "dientes de peine"/rulos. /match ajusta el rastro a las calles sin forzar el paso
+    exacto, devolviendo una polyline limpia y continua.
+    """
+    if len(coords) < 2:
+        return None
+    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords)
+    radiuses = ";".join(str(radius) for _ in coords)
+    url = f"{osrm_url}/match/v1/driving/{coords_str}"
+    params = {
+        "overview": "full",
+        "geometries": "geojson",
+        "tidy": "true",       # descarta puntos redundantes/outliers del rastro
+        "gaps": "ignore",     # tratar como un único rastro continuo
+        "radiuses": radiuses,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "Ok" or not data.get("matchings"):
+            return None
+        geometry: list = []
+        for m in data["matchings"]:
+            geom = m.get("geometry", {}).get("coordinates") or []
+            if geometry and geom and geometry[-1] == geom[0]:
+                geom = geom[1:]
+            geometry.extend(geom)
+        return {"geometry": geometry}
+    except (requests.RequestException, KeyError, IndexError) as e:
+        log.debug("OSRM match failed: %s", e)
+        return None
+
+
 def is_osrm_available(osrm_url: str = DEFAULT_OSRM_URL) -> bool:
     try:
         resp = requests.get(f"{osrm_url}/route/v1/driving/-58.38,-34.60;-58.37,-34.61", timeout=3)
