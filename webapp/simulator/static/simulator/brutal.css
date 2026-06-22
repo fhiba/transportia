@@ -232,6 +232,8 @@ h2 { font-size: 17px; letter-spacing: 1px; text-transform: uppercase; margin: 0 
 .legend .row { display: flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: .5px; }
 .swatch { width: 22px; height: 6px; border: 1px solid var(--ink); display: inline-block; }
 .dot { width: 12px; height: 12px; border: 2px solid var(--ink); display: inline-block; }
+.gradient { width: 22px; height: 6px; border: 1px solid var(--ink); display: inline-block;
+  background: linear-gradient(to right, #2ecc71, #f1c40f 35%, #e67e22 65%, #c0392b); }
 
 .proposals { display: flex; flex-direction: column; gap: 16px; }
 .prop {

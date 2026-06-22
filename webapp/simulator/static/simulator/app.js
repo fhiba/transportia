@@ -3,12 +3,34 @@
   "use strict";
 
   var COLORS = {
-    current: "#C0392B",   // rojo — ruta actual
+    current: "#C0392B",   // rojo — ruta actual (fallback cuando no hay segments)
     zone:    "#B7892A",   // ocre — zona congestionada
     removed: "#C0392B",   // rojo — paradas eliminadas (familia ACTUAL)
     added:   "#1F8A4C",   // verde — paradas nuevas (familia PROPUESTO)
-    proposed:"#1F8A4C"    // verde — recorrido propuesto
+    proposed:"#1F8A4C",   // verde — recorrido propuesto
+    noData:  "#7F8C8D"    // gris — segmento sin datos de velocidad
   };
+
+  // Escala de color para intensidad 0→1 (verde=rapido, rojo=detenido)
+  function speedColor(intensity) {
+    if (intensity == null || intensity < 0) return COLORS.noData;
+    var stops = [
+      [0.00,  46, 204, 113],   // #2ecc71 verde
+      [0.35, 241, 196,  15],   // #f1c40f amarillo
+      [0.65, 230, 126,  34],   // #e67e22 naranja
+      [1.00, 192,  57,  43]    // #c0392b rojo
+    ];
+    var i = 0;
+    while (i < stops.length - 1 && intensity > stops[i + 1][0]) i++;
+    var lo = stops[i];
+    var hi = stops[Math.min(i + 1, stops.length - 1)];
+    var span = (hi[0] - lo[0]) || 1;
+    var t = (intensity - lo[0]) / span;
+    var r = Math.round(lo[1] + (hi[1] - lo[1]) * t);
+    var g = Math.round(lo[2] + (hi[2] - lo[2]) * t);
+    var b = Math.round(lo[3] + (hi[3] - lo[3]) * t);
+    return "rgb(" + r + "," + g + "," + b + ")";
+  }
 
   var summaryEl = document.getElementById("summary");
   var proposalsEl = document.getElementById("proposals");
@@ -29,9 +51,9 @@
 
   function legend() {
     legendEl.innerHTML =
-      '<div class="row"><span class="swatch" style="background:' + COLORS.current + '"></span> Ruta actual</div>' +
+      '<div class="row"><span class="gradient"></span> Velocidad por tramo</div>' +
+      '<div class="row" style="margin-left:2px"><span class="dot" style="background:' + COLORS.noData + '"></span> Sin datos GPS</div>' +
       '<div class="row"><span class="swatch" style="background:' + COLORS.proposed + '"></span> Recorrido propuesto</div>' +
-      '<div class="row"><span class="swatch" style="height:9px;background:' + COLORS.zone + ';opacity:.45"></span> Zona congestionada</div>' +
       '<div class="row"><span class="dot" style="background:' + COLORS.removed + '"></span> Parada eliminada</div>' +
       '<div class="row"><span class="dot" style="background:' + COLORS.added + '"></span> Parada nueva</div>';
   }
@@ -74,16 +96,39 @@
 
     var bounds = [];
 
-    if (data.current_geometry && data.current_geometry.length > 1) {
+    // Heatmap de congestión (sutil, debajo de la ruta) — radio chico para que no tape
+    if (window.L.heatLayer && data.heatmap_points && data.heatmap_points.length) {
+      L.heatLayer(data.heatmap_points, {
+        radius: 18,
+        blur: 12,
+        minOpacity: 0.25,
+        max: 1.0,
+        gradient: { 0.0: "#fff3a3", 0.4: "#ffae42", 0.7: "#ff6a2a", 1.0: "#c0392b" }
+      }).addTo(map);
+    }
+
+    // Ruta actual: colorear por tramo si hay current_segments, si no polyline uniforme
+    var segs = data.current_segments;
+    if (segs && segs.length) {
+      segs.forEach(function (seg) {
+        var color = seg.speed_kmh == null ? COLORS.noData : speedColor(seg.intensity);
+        var tip = seg.speed_kmh == null
+          ? "Sin datos de velocidad"
+          : seg.speed_kmh + " km/h · " + Math.round(seg.med_tt) + "s";
+        L.polyline(seg.points, { color: color, weight: 5, opacity: 0.9 })
+          .addTo(map).bindTooltip(tip);
+        bounds = bounds.concat(seg.points);
+      });
+    } else if (data.current_geometry && data.current_geometry.length > 1) {
       var cur = L.polyline(data.current_geometry, { color: COLORS.current, weight: 5, opacity: 0.85 }).addTo(map);
       bounds = bounds.concat(data.current_geometry);
       cur.bindTooltip("Ruta actual " + data.route);
     }
 
     data.proposals.forEach(function (p) {
-      // zona congestionada (marca recta gruesa A→B)
+      // zona congestionada (overlay sutil — el color del tramo ya marca la intensidad)
       L.polyline([[p.lat_A, p.lon_A], [p.lat_B, p.lon_B]],
-        { color: COLORS.zone, weight: 11, opacity: 0.4 }).addTo(map).bindTooltip("Zona congestionada");
+        { color: COLORS.zone, weight: 7, opacity: 0.25 }).addTo(map).bindTooltip("Zona congestionada");
 
       if (p.proposed_geometry && p.proposed_geometry.length > 1) {
         L.polyline(p.proposed_geometry, { color: COLORS.proposed, weight: 4, opacity: 0.95, dashArray: "1" })
@@ -107,12 +152,15 @@
   function setSummary(data) {
     var cls = data.total_savings_s > 0 ? "win" : "zero";
     summaryEl.className = "summary " + cls;
-    var route = data.routing === "sin-osrm"
-      ? " · ⚠ sin OSRM (rutas en línea recta)"
+    var src = data.current_geometry_source || data.routing;
+    var sourceLabel = src === "gtfs"
+      ? " · trazado GTFS oficial"
+      : src === "sin-osrm"
+      ? " · ⚠ sin OSRM (líneas rectas)"
       : " · calles vía " + data.routing;
     summaryEl.textContent =
       data.n_stops + " paradas · " + fmtMin(data.total_obs_s) + " observados · " +
-      "ahorro total −" + fmtMin(data.total_savings_s) + " (" + data.total_savings_pct + "%)" + route;
+      "ahorro total −" + fmtMin(data.total_savings_s) + " (" + data.total_savings_pct + "%)" + sourceLabel;
   }
 
   legend();

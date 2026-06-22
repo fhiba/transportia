@@ -45,30 +45,32 @@ def load_worst_route(sf: pd.DataFrame, route_scores_path: Path = None):
 def build_route_data(r_data: pd.DataFrame):
     best_trip = r_data.groupby("trip_id").size().sort_values(ascending=False).index[0]
     trip_data = r_data[r_data["trip_id"] == best_trip]
+    # reset_index() (sin drop=True) preserva arrival_seq como columna — útil para mergear
+    # stops_seq con seg_stats aun cuando falten segmentos consecutivos.
     stops_seq = trip_data.groupby("arrival_seq").agg(
         stop_id=("stop_id_A", "first"),
         lat=("stop_A_lat", "median"),
         lon=("stop_A_lon", "median"),
-    ).sort_index().reset_index(drop=True)
+    ).sort_index().reset_index()
     seg_stats = trip_data[trip_data["next_seq"] == trip_data["arrival_seq"] + 1].groupby(
         "arrival_seq"
     ).agg(
         med_tt=("travel_time_observed", "median"),
         med_dist=("distance_m", "median"),
-    ).sort_index().reset_index(drop=True)
+    ).sort_index().reset_index()
     return stops_seq, seg_stats
 
 
-def build_bus_graph(sf, stops_seq, use_osrm=False):
+def precompute_graph_inputs(sf):
+    """Agreggations over sf que NO dependen de la ruta: all_stops, stop_routes, graph_edges.
+
+    Se calculan una sola vez al cargar el módulo y se reutilizan por cada simulate_route().
+    """
     all_a = sf[["stop_id_A", "stop_A_lat", "stop_A_lon"]].dropna().drop_duplicates("stop_id_A")
     all_a.columns = ["stop_id", "lat", "lon"]
     all_b = sf[["stop_id_B", "stop_B_lat", "stop_B_lon"]].dropna().drop_duplicates("stop_id_B")
     all_b.columns = ["stop_id", "lat", "lon"]
     all_stops = pd.concat([all_a, all_b]).drop_duplicates("stop_id")
-
-    bbox_lat = (stops_seq["lat"].min() - 0.015, stops_seq["lat"].max() + 0.015)
-    bbox_lon = (stops_seq["lon"].min() - 0.015, stops_seq["lon"].max() + 0.015)
-    nearby = all_stops[all_stops["lat"].between(*bbox_lat) & all_stops["lon"].between(*bbox_lon)]
 
     stop_routes = sf.dropna(subset=["stop_A_lat"]).groupby("stop_id_A")[
         "route_short_name"
@@ -81,6 +83,24 @@ def build_bus_graph(sf, stops_seq, use_osrm=False):
         n=("travel_time_observed", "count"),
     ).reset_index()
     graph_edges = graph_edges[graph_edges["n"] >= 3]
+
+    return {"all_stops": all_stops, "stop_routes": stop_routes, "graph_edges": graph_edges}
+
+
+def build_bus_graph(sf, stops_seq, use_osrm=False, precomputed=None):
+    if precomputed is not None:
+        all_stops = precomputed["all_stops"]
+        stop_routes = precomputed["stop_routes"]
+        graph_edges = precomputed["graph_edges"]
+    else:
+        agg = precompute_graph_inputs(sf)
+        all_stops = agg["all_stops"]
+        stop_routes = agg["stop_routes"]
+        graph_edges = agg["graph_edges"]
+
+    bbox_lat = (stops_seq["lat"].min() - 0.015, stops_seq["lat"].max() + 0.015)
+    bbox_lon = (stops_seq["lon"].min() - 0.015, stops_seq["lon"].max() + 0.015)
+    nearby = all_stops[all_stops["lat"].between(*bbox_lat) & all_stops["lon"].between(*bbox_lon)]
 
     zone_ids = set(nearby["stop_id"])
     zone_edges = graph_edges[
@@ -101,28 +121,35 @@ def build_bus_graph(sf, stops_seq, use_osrm=False):
     n_osrm_calls = 0
     max_osrm_calls = 500
 
+    # Pre-extraer columnas a arrays de numpy: iloc[i] en un loop de miles de pares es ~100x más lento
+    nb_ids = nearby["stop_id"].values
+    nb_lats = nearby["lat"].values
+    nb_lons = nearby["lon"].values
+
     for i, j in pairs:
-        s = nearby.iloc[i]
-        t = nearby.iloc[j]
-        if s["stop_id"] in route_stop_ids and t["stop_id"] in route_stop_ids:
+        s_id = nb_ids[i]
+        t_id = nb_ids[j]
+        if s_id in route_stop_ids and t_id in route_stop_ids:
             continue
-        if not G.has_edge(s["stop_id"], t["stop_id"]):
-            d_haversine = haversine_m(s["lat"], s["lon"], t["lat"], t["lon"])
+        if not G.has_edge(s_id, t_id):
+            s_lat, s_lon = nb_lats[i], nb_lons[i]
+            t_lat, t_lon = nb_lats[j], nb_lons[j]
+            d_haversine = haversine_m(s_lat, s_lon, t_lat, t_lon)
 
             est_tt = d_haversine / MEDIAN_SPEED_MPS
             est_dist = d_haversine
             geometry = None
 
             if use_osrm and n_osrm_calls < max_osrm_calls:
-                route = get_route(s["lon"], s["lat"], t["lon"], t["lat"])
+                route = get_route(s_lon, s_lat, t_lon, t_lat)
                 if route:
                     est_tt = route["duration_s"]
                     est_dist = route["distance_m"]
                     geometry = route["geometry"]
                     n_osrm_calls += 1
 
-            G.add_edge(s["stop_id"], t["stop_id"], weight=est_tt, observed=False, distance=est_dist, geometry=geometry)
-            G.add_edge(t["stop_id"], s["stop_id"], weight=est_tt, observed=False, distance=est_dist, geometry=geometry)
+            G.add_edge(s_id, t_id, weight=est_tt, observed=False, distance=est_dist, geometry=geometry)
+            G.add_edge(t_id, s_id, weight=est_tt, observed=False, distance=est_dist, geometry=geometry)
 
     log.info("OSRM calls used: %d", n_osrm_calls)
     return G, nearby, stop_routes
@@ -131,7 +158,9 @@ def build_bus_graph(sf, stops_seq, use_osrm=False):
 def find_bottleneck_zones(seg_stats, stops_seq, p90=None):
     if p90 is None:
         p90 = seg_stats["med_tt"].quantile(0.85)
-    mean_speed = seg_stats["med_dist"].sum() / seg_stats["med_tt"].sum()
+    total_tt = float(seg_stats["med_tt"].sum())
+    total_dist = float(seg_stats["med_dist"].sum())
+    mean_speed = total_dist / total_tt if total_tt > 0 else 0.0
 
     zones = []
     i = 0
@@ -144,6 +173,10 @@ def find_bottleneck_zones(seg_stats, stops_seq, p90=None):
             if end - start >= 1:
                 zone_tt = seg_stats.iloc[start:end]["med_tt"].sum()
                 zone_dist = seg_stats.iloc[start:end]["med_dist"].sum()
+                # Sin mean_speed no podemos comparar; descartamos la zona.
+                if mean_speed <= 0:
+                    i += 1
+                    continue
                 expected_tt = zone_dist / mean_speed
                 if zone_tt > expected_tt * 1.3 and zone_tt > 120:
                     zones.append({
