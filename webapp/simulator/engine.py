@@ -69,6 +69,7 @@ DETOUR_MAX_FACTOR = 1.6           # si la alternativa rodea > 1.6× la original,
 OSRM_AVAILABILITY_TTL = 60.0      # re-checkear OSRM cada 60s, no por request
 
 CACHE_DIR = OUTPUTS_DIR / "cache"
+TRACES_DIR = OUTPUTS_DIR / "observed_traces"
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +140,30 @@ def _load_gtfs_shapes():
     return shape_lookup, trip_shape
 
 
+def _load_observed_traces() -> dict[str, dict]:
+    """Carga traces observadas (GPS) desde outputs/observed_traces/*.json.
+
+    Cada archivo tiene ``{route, points, segments: [{points, speed_kmh, ...}]}``.
+    Si el directorio no existe o está vacío, devuelve {} y el simulador cae a GTFS shape / stops.
+    """
+    traces: dict[str, dict] = {}
+    if not TRACES_DIR.exists():
+        return traces
+    for fp in TRACES_DIR.glob("*.json"):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
+            pts = data.get("points") or []
+            route = data.get("route") or fp.stem
+            if len(pts) >= 2:
+                traces[str(route)] = data
+        except (OSError, json.JSONDecodeError):
+            continue
+    return traces
+
+
 _GRAPH_INPUTS, _SHAPE_LOOKUP, _TRIP_SHAPE = _build_precomputed()
+_OBSERVED_TRACES = _load_observed_traces()
 
 
 def data_ready() -> bool:
@@ -351,15 +375,27 @@ def _shape_stop_distance_m(shape_pts: list[list[float]], stops_seq) -> float:
     return total / n if n else float("inf")
 
 
-def _resolve_current_shape(r_data, stops_seq, osrm_url) -> tuple[list[list[float]], str]:
+def _resolve_current_shape(
+    route_short_name: str, r_data, stops_seq, osrm_url
+) -> tuple[list[list[float]], str]:
     """Elige la polilínea para la ruta actual.
 
-    Devuelve el shape GTFS más común entre los trips observados. La validación fino
-    (qué paradas caen cerca del shape vs lejos) la hace ``_shape_to_segments``, que
-    mezcla slices del shape con stops rectos según corresponda.
+    Prioridades:
+      1. Trace observada (GPS) — sigue las calles reales del colectivo.
+         Precomputada por ``webapp/precompute_traces.py``.
+      2. GTFS shape oficial (fallback).
+      3. Recto entre paradas (fallback final).
 
-    Si no hay ningún shape candidato, cae a stops rectos.
+    La mezcla fina (qué paradas caen cerca del shape vs lejos) la hace
+    ``_shape_to_segments``, que produce slices del shape o stops rectos según
+    corresponda, así que podemos tolerar shapes que cubran solo parte del recorrido.
     """
+    # 1. Trace observada (GPS)
+    if route_short_name in _OBSERVED_TRACES:
+        trace = _OBSERVED_TRACES[route_short_name]
+        return trace.get("points", []), "observed"
+
+    # 2. GTFS shape más común entre los trips observados
     if _SHAPE_LOOKUP and _TRIP_SHAPE:
         from collections import Counter
         shape_counter: Counter = Counter()
@@ -369,13 +405,43 @@ def _resolve_current_shape(r_data, stops_seq, osrm_url) -> tuple[list[list[float
                 shape_counter[sid] += 1
 
         if shape_counter:
-            # Tomar el shape más frecuente (típicamente la variante principal)
             best_sid, _ = shape_counter.most_common(1)[0]
             return _SHAPE_LOOKUP[best_sid], "gtfs"
 
-    # Fallback: stops rectos
+    # 3. Stops rectos
     current_latlon = [(float(r["lat"]), float(r["lon"])) for _, r in stops_seq.iterrows()]
     return [[lat, lon] for lat, lon in current_latlon], "stops"
+
+
+def _intensity_from_observed_segments(segments: list[dict]) -> list[dict]:
+    """Convierte segments crudos de la trace observada al formato que usa el frontend.
+
+    Cada segment del JSON tiene ``{points, speed_kmh, dt_s, dist_m}``.
+    Calcula ``intensity`` relativo a la velocidad media de la trace.
+    """
+    if not segments:
+        return []
+    speeds = [s.get("speed_kmh", 0) or 0 for s in segments]
+    valid = [v for v in speeds if v > 0]
+    if not valid:
+        return []
+    mean_speed_kmh = sum(valid) / len(valid)
+
+    out: list[dict] = []
+    for s in segments:
+        speed = s.get("speed_kmh") or 0
+        # intensity ∈ [0, 1]: 0 = a velocidad media o mejor, 1 = detenido
+        if mean_speed_kmh > 0 and speed > 0:
+            intensity = max(0.0, min(1.0, (mean_speed_kmh - speed) / mean_speed_kmh))
+        else:
+            intensity = 0.0
+        out.append({
+            "points": s["points"],
+            "intensity": round(intensity, 3),
+            "speed_kmh": s.get("speed_kmh"),
+            "med_tt": s.get("dt_s"),
+        })
+    return out
 
 
 def _shape_to_segments(
@@ -565,13 +631,22 @@ def simulate_route(route_short_name: str) -> dict:
         else "sin-osrm"
     )
 
-    # Fase 0a (validada): ruta actual desde GTFS shape VALIDADO contra paradas observadas.
-    # Si no calza, cae a stops rectos (siempre correcto en endpoints).
-    current_geometry, geometry_source = _resolve_current_shape(r_data, stops_seq, osrm_url)
-    routing_label = geometry_source if geometry_source == "gtfs" else routing
+    # Fase 0a (validada): ruta actual priorizando trace GPS observada.
+    # Si no hay, cae a GTFS shape; si no calza, a stops rectos.
+    current_geometry, geometry_source = _resolve_current_shape(
+        route_short_name, r_data, stops_seq, osrm_url
+    )
+    routing_label = geometry_source
 
-    # Fase 0c (C): segmentar y pegar velocidad para colorear por tramo
-    current_segments: list[dict] = _shape_to_segments(current_geometry, stops_seq, seg_stats)
+    # Fase 0c (C): segmentar y pegar velocidad para colorear por tramo.
+    # Si la source es trace observada, usar los segments pre-calculados con velocidad real.
+    # Si no (gtfs/stops), calcular alineando stops_seq con el shape.
+    if geometry_source == "observed" and route_short_name in _OBSERVED_TRACES:
+        current_segments = _intensity_from_observed_segments(
+            _OBSERVED_TRACES[route_short_name].get("segments", [])
+        )
+    else:
+        current_segments = _shape_to_segments(current_geometry, stops_seq, seg_stats)
 
     # Fase 0b: presupuesto OSRM dedicado por propuesta (no compartido)
     out_proposals = []
