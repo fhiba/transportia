@@ -25,6 +25,7 @@
 
   var markers = { a: null, b: null };
   var routeLayer = null;
+  var nearbyLayer = null;  // capa de paradas cercanas
 
   function fmtMin(s) { return (s / 60).toFixed(1) + " min"; }
   function fmtKm(m) { return (m / 1000).toFixed(2) + " km"; }
@@ -37,6 +38,15 @@
             'justify-content:center;font:700 12px monospace;color:#E5DECB;">' + (glyph || "") + "</div>",
       iconSize: [22, 22],
       iconAnchor: [11, 11]
+    });
+  }
+
+  function stopIcon() {
+    return L.divIcon({
+      className: "",
+      html: '<div style="width:8px;height:8px;background:#7F8C8D;border:1.5px solid #16181A;border-radius:50%;"></div>',
+      iconSize: [8, 8],
+      iconAnchor: [4, 4]
     });
   }
 
@@ -56,6 +66,10 @@
     if (routeLayer) {
       map.removeLayer(routeLayer);
       routeLayer = null;
+    }
+    if (nearbyLayer) {
+      map.removeLayer(nearbyLayer);
+      nearbyLayer = null;
     }
     statsEl.hidden = true;
     errorEl.hidden = true;
@@ -112,29 +126,63 @@
       color: COLORS.route, weight: 5, opacity: 0.9
     }).addTo(map).bindTooltip("Ruta óptima · " + fmtKm(data.distance_m));
 
+    // Paradas cercanas al corridor (capa aparte para poder limpiarlas juntas)
+    if (data.nearby_stops && data.nearby_stops.length) {
+      nearbyLayer = L.layerGroup().addTo(map);
+      data.nearby_stops.forEach(function (s) {
+        var lines = (s.lines && s.lines.length) ? " [" + s.lines.slice(0, 4).join(", ") + "]" : "";
+        L.marker([s.lat, s.lon], { icon: stopIcon() })
+          .addTo(nearbyLayer)
+          .bindTooltip("Parada " + s.stop_id + lines);
+      });
+    }
+
     // Ajustar viewport
     var bounds = L.latLngBounds(data.geometry);
     bounds.extend(markers.a.getLatLng());
     bounds.extend(markers.b.getLatLng());
     map.fitBounds(bounds, { padding: [30, 30] });
 
-    // Resumen arriba
+    // Resumen arriba: cuál de las 3 estimaciones usar como principal
+    var mainBus = data.duration_bus_observed_s != null
+      ? data.duration_bus_observed_s
+      : data.duration_bus_simple_s;
+    var mainLabel = data.duration_bus_observed_s != null ? "observado" : "lineal";
     var viaOsrm = data.routing === "osrm-local" ? "OSRM local" : "OSRM";
     summaryEl.className = "summary win";
     summaryEl.textContent =
-      fmtKm(data.distance_m) + " · colectivo ~" + fmtMin(data.duration_bus_s) +
-      " @ " + data.bus_speed_kmh + " km/h (modelo) · auto ~" + fmtMin(data.duration_car_s) + " · " + viaOsrm;
+      fmtKm(data.distance_m) + " · colectivo ~" + fmtMin(mainBus) + " (" + mainLabel + ")" +
+      " · auto ~" + fmtMin(data.duration_car_s) + " · " + viaOsrm +
+      " · " + data.nearby_stops.length + " paradas cercanas";
 
     // Panel de stats
+    var observedRows = "";
+    if (data.duration_bus_observed_s != null) {
+      var deltaClass = "delta-flat";
+      if (data.delta_pct > 30) deltaClass = "delta-bad";
+      else if (data.delta_pct < 10) deltaClass = "delta-good";
+      var covPct = Math.round(data.observed_coverage_m / data.distance_m * 100);
+      observedRows =
+        '<div class="stat-row"><span>TIEMPO COLECTIVO (observado)</span><b>' + fmtMin(data.duration_bus_observed_s) + '</b></div>' +
+        '<div class="stat-row"><span>VELOCIDAD OBSERVADA</span><b>' + data.observed_speed_kmh + ' km/h</b></div>' +
+        '<div class="stat-row ' + deltaClass + '"><span>Δ vs LINEAL</span><b>' + (data.delta_pct > 0 ? "+" : "") + data.delta_pct + '%</b></div>' +
+        '<div class="stat-row"><span>COBERTURA MODELO</span><b>' + covPct + '% del corridor</b></div>';
+    }
+
     statsEl.hidden = false;
     statsEl.innerHTML =
       '<div class="stat-row"><span>DISTANCIA</span><b>' + fmtKm(data.distance_m) + '</b></div>' +
-      '<div class="stat-row"><span>TIEMPO COLECTIVO (modelo)</span><b>' + fmtMin(data.duration_bus_s) + '</b></div>' +
-      '<div class="stat-row"><span>VELOCIDAD MEDIA</span><b>' + data.bus_speed_kmh + ' km/h</b></div>' +
       '<div class="stat-row"><span>TIEMPO AUTO (OSRM)</span><b>' + fmtMin(data.duration_car_s) + '</b></div>' +
-      '<div class="stat-row"><span>PUNTOS DE RUTA</span><b>' + data.n_points + '</b></div>' +
-      '<p class="stat-note">La velocidad media (' + data.bus_speed_kmh + ' km/h) sale de la mediana observada ' +
-      'en todos los segmentos GPS del dataset. El tiempo de colectivo es la distancia OSRM dividida por esa velocidad.</p>';
+      '<div class="stat-row"><span>TIEMPO COLECTIVO (lineal)</span><b>' + fmtMin(data.duration_bus_simple_s) + '</b></div>' +
+      observedRows +
+      '<div class="stat-row"><span>VELOCIDAD MEDIA (modelo)</span><b>' + data.bus_speed_kmh + ' km/h</b></div>' +
+      '<div class="stat-row"><span>PARADAS CERCANAS</span><b>' + data.nearby_stops.length + '</b></div>' +
+      '<p class="stat-note"><b>¿Es óptima?</b> Compará los tiempos. El "lineal" usa la velocidad media global (' +
+      data.bus_speed_kmh + ' km/h); el "observado" usa los tiempos reales de colectivos en paradas cercanas al corridor (' +
+      (data.duration_bus_observed_s != null
+        ? data.observed_coverage_m / 1000 + ' km cubiertos'
+        : 'cobertura insuficiente') +
+      '). Δ &gt;30% indica congestión real; Δ &lt;10% indica zona fluida.</p>';
   }
 
   // Click en mapa → asignar A, luego B, luego resetear

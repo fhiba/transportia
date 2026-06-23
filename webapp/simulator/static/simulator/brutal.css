@@ -326,4 +326,7 @@ h2 { font-size: 17px; letter-spacing: 1px; text-transform: uppercase; margin: 0 
   font-size: 11px; letter-spacing: .5px; color: var(--gris); font-weight: 700;
 }
 .stat-row b { font-size: 16px; color: var(--ink); font-weight: 800; }
+.stat-row.delta-good b { color: #1F8A4C; }   /* verde: zona fluida */
+.stat-row.delta-bad b { color: #C0392B; }    /* rojo: congestión */
+.stat-row.delta-flat b { color: var(--militar); }  /* neutral */
 .stat-note { font-size: 11px; color: var(--gris); margin-top: 12px; line-height: 1.4; font-weight: 500; }

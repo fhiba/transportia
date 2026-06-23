@@ -214,6 +214,42 @@ def _compute_valid_lines() -> set[str]:
 _VALID_LINES = _compute_valid_lines()
 
 
+# ---------------------------------------------------------------------------
+# Lookup tables globales para routing A→B (precomputadas una vez al importar)
+# ---------------------------------------------------------------------------
+def _build_route_lookups():
+    """Estructuras para evaluar rutas A→B contra el modelo observado.
+
+    - _STOP_TREE: KDTree sobre (lat, lon) de todas las paradas → snap y query_ball.
+    - _STOP_COORDS: {stop_id: (lat, lon)}.
+    - _STOP_LINES: {stop_id: [route_short_name, ...]} (líneas que tocan la parada).
+    - _EDGE_TT: {(stop_A, stop_B): med_tt} con tiempos observados reales.
+    """
+    if _GRAPH_INPUTS is None:
+        return None, None, None, None
+    from scipy.spatial import cKDTree
+    import numpy as _np
+
+    all_stops = _GRAPH_INPUTS["all_stops"]
+    stop_routes = _GRAPH_INPUTS["stop_routes"]
+    graph_edges = _GRAPH_INPUTS["graph_edges"]
+
+    tree = cKDTree(_np.radians(all_stops[["lat", "lon"]].values))
+    stop_coords = {
+        str(sid): (float(lat), float(lon))
+        for sid, lat, lon in zip(all_stops["stop_id"].values, all_stops["lat"].values, all_stops["lon"].values)
+    }
+    stop_lines = {str(k): [str(x) for x in v] for k, v in stop_routes.items()}
+    edge_tt = {
+        (str(a), str(b)): float(t)
+        for a, b, t in zip(graph_edges["stop_id_A"].values, graph_edges["stop_id_B"].values, graph_edges["med_tt"].values)
+    }
+    return tree, stop_coords, stop_lines, edge_tt
+
+
+_STOP_TREE, _STOP_COORDS, _STOP_LINES, _EDGE_TT = _build_route_lookups()
+
+
 def data_ready() -> bool:
     return _SF is not None
 
@@ -821,14 +857,117 @@ def _segment_geometry(geometry: list[list[float]], speed_kmh: float) -> list[dic
     return out
 
 
+def _nearby_stops_along_corridor(
+    geometry: list[list[float]], radius_m: float = 150.0
+) -> list[dict]:
+    """Paradas observadas a <=radius_m de la polyline, ordenadas por aparición.
+
+    Recorre la polyline y junta todas las paradas cercanas (query_ball por
+    punto). Devuelve una lista única en el orden en que aparecen a lo largo de
+    la ruta, con stop_id, lat, lon y líneas que la tocan.
+    """
+    if _STOP_TREE is None or len(geometry) < 2:
+        return []
+    import numpy as np
+
+    radius_rad = radius_m / 6_371_000.0
+    pts_rad = np.radians([[p[0], p[1]] for p in geometry])
+    idx_sets = _STOP_TREE.query_ball_point(pts_rad, r=radius_rad)
+
+    # Para ordenar por primera aparición a lo largo de la ruta
+    seen: dict[str, int] = {}
+    for indices in idx_sets:
+        for i in indices:
+            sid = str(_GRAPH_INPUTS["all_stops"]["stop_id"].iloc[i])
+            if sid not in seen:
+                seen[sid] = len(seen)
+
+    out: list[dict] = []
+    for sid in sorted(seen, key=seen.get):
+        coords = _STOP_COORDS.get(sid)
+        if not coords:
+            continue
+        out.append({
+            "stop_id": sid,
+            "lat": round(coords[0], 6),
+            "lon": round(coords[1], 6),
+            "lines": _STOP_LINES.get(sid, []),
+        })
+    return out
+
+
+def _observed_speed_along_corridor(stops: list[dict]) -> tuple[float | None, float]:
+    """Velocidad observada del colectivo en el corridor, vía edges del modelo.
+
+    Recorre ``stops`` en orden de aparición a lo largo de la ruta. Desde cada
+    parada, busca el edge observado MÁS LARGO (hasta 5 posiciones adelante)
+    cuyo endpoint también esté en ``stops`` y cuya distancia caiga en el rango
+    de velocidad crucero (200-2000m, para excluir detenciones en paradas
+    adyacentes). Avanza greedy al final del edge cubierto, sin solapar.
+
+    Devuelve:
+      - speed_mps: velocidad crucero observada en los tramos cubiertos.
+      - covered_m: suma de distancias de los edges cubiertos (sin solapar).
+    """
+    if not _EDGE_TT or len(stops) < 2:
+        return None, 0.0
+    pos_to_stop = {i: s["stop_id"] for i, s in enumerate(stops)}
+    coords = {s["stop_id"]: (s["lat"], s["lon"]) for s in stops}
+
+    WINDOW = 5
+    MIN_EDGE_M = 200.0
+    MAX_EDGE_M = 2000.0
+    MIN_COVERED_M = 500.0
+
+    total_tt = 0.0
+    total_dist = 0.0
+    i, n = 0, len(stops)
+    while i < n:
+        a_id = pos_to_stop.get(i)
+        if not a_id:
+            i += 1
+            continue
+        # Buscar el edge más largo desde i hasta i+k (k <= WINDOW)
+        best_k, best_tt, best_dist = 0, 0.0, 0.0
+        for k in range(1, min(WINDOW + 1, n - i)):
+            b_id = pos_to_stop.get(i + k)
+            if not b_id:
+                continue
+            tt = _EDGE_TT.get((a_id, b_id)) or _EDGE_TT.get((b_id, a_id))
+            if not tt or tt <= 0:
+                continue
+            ca, cb = coords.get(a_id), coords.get(b_id)
+            if not ca or not cb:
+                continue
+            d = haversine_m(ca[0], ca[1], cb[0], cb[1])
+            if not (MIN_EDGE_M <= d <= MAX_EDGE_M):
+                continue
+            if d > best_dist:
+                best_dist, best_tt, best_k = d, tt, k
+
+        if best_k > 0:
+            total_tt += best_tt
+            total_dist += best_dist
+            i += best_k  # saltar al final del edge (sin solapar)
+        else:
+            i += 1
+
+    if total_tt <= 0 or total_dist < MIN_COVERED_M:
+        return None, total_dist
+    return total_dist / total_tt, total_dist
+
+
 def route_between(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> dict:
     """Traza una ruta de colectivo entre dos puntos arbitrarios del mapa.
 
-    Usa OSRM para la geometría (calles reales) y la velocidad media observada
-    del modelo para estimar el tiempo que tardaría un colectivo.
+    Geometría: OSRM (ruta óptima por la red vial).
+    Tiempo: tres estimaciones para comparar:
+      - duration_car_s: tiempo de auto (OSRM).
+      - duration_bus_simple_s: distance × velocidad media observada (lineal).
+      - duration_bus_observed_s (si hay datos): suma de tiempos observados
+        reales de los tramos cercanos al corridor, contra el modelo.
 
-    A diferencia de ``simulate_route`` (que simula una línea existente), esta
-    función propone un recorrido nuevo óptimo según la red vial.
+    Devuelve también la lista de paradas cercanas para dibujarlas como contexto.
     """
     if _SF is None:
         return {"error": _LOAD_ERROR or "Datos no disponibles."}
@@ -847,23 +986,46 @@ def route_between(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> dic
     distance_m = float(res["distance_m"])
     duration_car_s = float(res["duration_s"])
 
-    # 2. Tiempo estimado de colectivo usando la velocidad del modelo
+    # 2. Tiempo lineal basado en la velocidad media del modelo
     bus_speed_mps = _median_observed_speed_mps()
     bus_speed_kmh = bus_speed_mps * 3.6
-    bus_duration_s = distance_m / bus_speed_mps if bus_speed_mps > 0 else duration_car_s
+    bus_simple_s = distance_m / bus_speed_mps if bus_speed_mps > 0 else duration_car_s
 
-    # 3. Segmentos para colorear
+    # 3. Paradas cercanas al corridor + tiempo observado real del modelo
+    nearby = _nearby_stops_along_corridor(geometry)
+    obs_speed_mps = None
+    obs_covered_m = 0.0
+    observed_s = None
+    if len(nearby) >= 2:
+        obs_speed_mps, obs_covered_m = _observed_speed_along_corridor(nearby)
+        if obs_speed_mps and obs_speed_mps > 0:
+            # Extrapolamos la velocidad observada al corridor completo
+            observed_s = distance_m / obs_speed_mps
+
+    # 4. Delta entre estimaciones (% de congestión real sobre la media)
+    delta_pct = None
+    if observed_s and bus_simple_s > 0:
+        delta_pct = round((observed_s - bus_simple_s) / bus_simple_s * 100, 1)
+
+    # 5. Segmentos para colorear (uniformes; no tenemos datos por subtramo aquí)
     segments = _segment_geometry(geometry, bus_speed_kmh)
 
+    obs_speed_kmh = round(obs_speed_mps * 3.6, 1) if obs_speed_mps else None
     return {
         "from": {"lat": float(a_lat), "lon": float(a_lon)},
         "to": {"lat": float(b_lat), "lon": float(b_lon)},
         "geometry": geometry,
         "segments": segments,
+        "nearby_stops": nearby,
         "distance_m": round(distance_m, 1),
         "duration_car_s": round(duration_car_s, 1),
-        "duration_bus_s": round(bus_duration_s, 1),
+        "duration_bus_simple_s": round(bus_simple_s, 1),
+        "duration_bus_observed_s": round(observed_s, 1) if observed_s else None,
+        "delta_pct": delta_pct,
         "bus_speed_kmh": round(bus_speed_kmh, 1),
+        "observed_speed_kmh": obs_speed_kmh,
+        "observed_coverage_m": round(obs_covered_m, 1),
         "n_points": len(geometry),
+        "n_nearby_stops": len(nearby),
         "routing": "osrm-local" if osrm_url == DEFAULT_OSRM_URL else "osrm",
     }
