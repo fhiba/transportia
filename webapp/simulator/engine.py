@@ -28,6 +28,7 @@ from utils import OUTPUTS_DIR, haversine_m, load_gtfs_tables  # noqa: E402
 from osrm_routing import (  # noqa: E402
     DEFAULT_OSRM_URL,
     PUBLIC_OSRM_URL,
+    get_route,
     get_route_waypoints,
     is_osrm_available,
     match_route,
@@ -766,3 +767,103 @@ def simulate_route(route_short_name: str) -> dict:
     # Fase 1b: guardar en cache en memoria
     _RESULT_CACHE[route_short_name] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Routing A → B entre dos puntos arbitrarios del mapa
+# ---------------------------------------------------------------------------
+def _median_observed_speed_mps() -> float:
+    """Mediana de (distance_m / travel_time_observed) sobre segments_features.
+
+    Es la velocidad típica de un colectivo urbano según el modelo. Se cachea en
+    el módulo para no recalcularla en cada request.
+    """
+    cached = getattr(_median_observed_speed_mps, "_cached", None)
+    if cached is not None:
+        return cached
+    if _SF is None:
+        _median_observed_speed_mps._cached = 5.5  # ~20 km/h fallback
+        return _median_observed_speed_mps._cached
+    sf = _SF.dropna(subset=["distance_m", "travel_time_observed"])
+    sf = sf[(sf["distance_m"] > 0) & (sf["travel_time_observed"] > 0)]
+    speeds = sf["distance_m"] / sf["travel_time_observed"]
+    _median_observed_speed_mps._cached = float(speeds.median()) if len(speeds) else 5.5
+    return _median_observed_speed_mps._cached
+
+
+def _segment_geometry(geometry: list[list[float]], speed_kmh: float) -> list[dict]:
+    """Parte la polyline en chunks de ~8 puntos con velocidad uniforme.
+
+    Para visualizar la ruta A→B con el mismo formato que las líneas existentes
+    (segmentos coloreados por velocidad). Aquí todos los segmentos tienen la
+    velocidad media observada del modelo, así que el color será homogéneo.
+    """
+    if len(geometry) < 2:
+        return []
+    CHUNK = 8
+    out: list[dict] = []
+    n = len(geometry)
+    speed_mps = speed_kmh / 3.6 if speed_kmh > 0 else 0.0
+    for start in range(0, n - 1, CHUNK):
+        end = min(start + CHUNK + 1, n)
+        pts = geometry[start:end]
+        dist_m = sum(
+            haversine_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+            for i in range(len(pts) - 1)
+        )
+        dt_s = dist_m / speed_mps if speed_mps > 0 else 0.0
+        out.append({
+            "points": pts,
+            "speed_kmh": round(speed_kmh, 1),
+            "intensity": 0.0,
+            "med_tt": round(dt_s, 1),
+        })
+    return out
+
+
+def route_between(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> dict:
+    """Traza una ruta de colectivo entre dos puntos arbitrarios del mapa.
+
+    Usa OSRM para la geometría (calles reales) y la velocidad media observada
+    del modelo para estimar el tiempo que tardaría un colectivo.
+
+    A diferencia de ``simulate_route`` (que simula una línea existente), esta
+    función propone un recorrido nuevo óptimo según la red vial.
+    """
+    if _SF is None:
+        return {"error": _LOAD_ERROR or "Datos no disponibles."}
+
+    osrm_url = _pick_osrm_url()
+    if not osrm_url:
+        return {"error": "OSRM no disponible. Levantá el docker para usar esta función."}
+
+    # 1. Geometría OSRM entre A y B
+    res = get_route(a_lon, a_lat, b_lon, b_lat, osrm_url=osrm_url, timeout=OSRM_TIMEOUT)
+    if not res or not res.get("geometry"):
+        return {"error": "OSRM no pudo trazar la ruta entre esos puntos."}
+
+    geometry_lonlat = res["geometry"]  # [[lon, lat], ...]
+    geometry = [[p[1], p[0]] for p in geometry_lonlat]  # → [[lat, lon], ...]
+    distance_m = float(res["distance_m"])
+    duration_car_s = float(res["duration_s"])
+
+    # 2. Tiempo estimado de colectivo usando la velocidad del modelo
+    bus_speed_mps = _median_observed_speed_mps()
+    bus_speed_kmh = bus_speed_mps * 3.6
+    bus_duration_s = distance_m / bus_speed_mps if bus_speed_mps > 0 else duration_car_s
+
+    # 3. Segmentos para colorear
+    segments = _segment_geometry(geometry, bus_speed_kmh)
+
+    return {
+        "from": {"lat": float(a_lat), "lon": float(a_lon)},
+        "to": {"lat": float(b_lat), "lon": float(b_lon)},
+        "geometry": geometry,
+        "segments": segments,
+        "distance_m": round(distance_m, 1),
+        "duration_car_s": round(duration_car_s, 1),
+        "duration_bus_s": round(bus_duration_s, 1),
+        "bus_speed_kmh": round(bus_speed_kmh, 1),
+        "n_points": len(geometry),
+        "routing": "osrm-local" if osrm_url == DEFAULT_OSRM_URL else "osrm",
+    }

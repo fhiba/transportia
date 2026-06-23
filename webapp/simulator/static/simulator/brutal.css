@@ -263,3 +263,67 @@ h2 { font-size: 17px; letter-spacing: 1px; text-transform: uppercase; margin: 0 
 .prop .lbl { font-size: 10px; letter-spacing: 1px; color: var(--gris); margin-top: 8px; }
 
 .empty { color: var(--gris); }
+
+/* ---- CTA custom (página de trazar ruta) ---- */
+.cta-custom {
+  display: inline-block;
+  margin-top: 14px;
+  background: var(--ink);
+  color: var(--paper);
+  border: 3px solid var(--ink);
+  box-shadow: var(--shadow-sm);
+  padding: 10px 16px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-size: 13px;
+  text-decoration: none;
+}
+.cta-custom:hover { background: var(--oxido); }
+
+/* ---- Página "Trazar ruta" ---- */
+.route-inputs {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 16px; padding-top: 16px;
+  border-top: 2px dashed var(--gris);
+}
+.route-inputs label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 10px; letter-spacing: 1px; color: var(--gris); font-weight: 700;
+}
+.route-inputs input {
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  padding: 8px 10px;
+  font: 600 13px monospace;
+  color: var(--ink);
+}
+.route-inputs input:focus { outline: 2px solid var(--oxido); }
+.btn-primary, .btn-secondary {
+  border: 3px solid var(--ink);
+  box-shadow: var(--shadow-sm);
+  padding: 9px 12px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-size: 12px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+.btn-primary { background: var(--militar); color: var(--paper); }
+.btn-primary:hover { background: var(--oxido); }
+.btn-secondary { background: var(--paper); color: var(--ink); }
+.btn-secondary:hover { background: var(--gris); color: var(--paper); }
+
+.route-stats {
+  margin-top: 16px; padding-top: 16px;
+  border-top: 2px dashed var(--gris);
+}
+.stat-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--gris);
+  font-size: 11px; letter-spacing: .5px; color: var(--gris); font-weight: 700;
+}
+.stat-row b { font-size: 16px; color: var(--ink); font-weight: 800; }
+.stat-note { font-size: 11px; color: var(--gris); margin-top: 12px; line-height: 1.4; font-weight: 500; }

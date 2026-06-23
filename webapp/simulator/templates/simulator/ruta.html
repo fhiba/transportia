@@ -1,0 +1,53 @@
+{% extends "simulator/base.html" %}
+
+{% block title %}TRAZAR RUTA · TRANSPORTIA{% endblock %}
+
+{% block head %}
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+{% endblock %}
+
+{% block content %}
+  <a class="back" href="/">← VOLVER A LÍNEAS</a>
+
+  <section class="line-head">
+    <h1>TRAZAR <span class="route-name big">RUTA NUEVA</span></h1>
+    <div id="summary" class="summary">Tocá dos puntos del mapa para trazar una ruta de colectivo entre ellos.</div>
+  </section>
+
+  <div class="detail">
+    <div id="map" class="map"></div>
+    <aside class="panel">
+      <h2>RUTA A → B</h2>
+      <div class="legend">
+        <div class="row"><span class="dot" style="background:#1F8A4C"></span> Origen (A)</div>
+        <div class="row"><span class="dot" style="background:#C0392B"></span> Destino (B)</div>
+        <div class="row"><span class="swatch" style="background:#2ecc71"></span> Recorrido óptimo (OSRM)</div>
+      </div>
+
+      <div class="route-inputs">
+        <label>
+          ORIGEN (A)
+          <input id="from-input" type="text" placeholder="-34.6037, -58.3816" autocomplete="off">
+        </label>
+        <label>
+          DESTINO (B)
+          <input id="to-input" type="text" placeholder="-34.6080, -58.3838" autocomplete="off">
+        </label>
+        <button id="trace-btn" class="btn-primary" type="button">TRAZAR RUTA</button>
+        <button id="clear-btn" class="btn-secondary" type="button">LIMPIAR</button>
+      </div>
+
+      <div id="route-stats" class="route-stats" hidden></div>
+      <p id="route-error" class="empty" hidden></p>
+    </aside>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+  {% load static %}
+  <script src="{% static 'simulator/route.js' %}"></script>
+{% endblock %}
