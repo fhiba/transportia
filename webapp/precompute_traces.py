@@ -38,6 +38,7 @@ MIN_STEP_M = 100.0      # submuestrear: un punto cada ~100m (densidad uniforme s
 MAX_POINTS = 300        # si después de limpiar quedan más, submuestrear uniformemente
 MIN_POINTS = 10         # si quedan menos, descartar la trace
 MIN_PINGS_PER_TRIP = 50  # mínimo de pings para considerar un trip válido
+MIN_TRAVELED_M = 5000.0  # descarta vehículos parados / viajes triviales (<5km recorridos)
 POINTS_PER_SEGMENT = 8   # cada segmento coloreado cubre ~N puntos consecutivos de la trace
 TRIP_GAP_S = 600.0       # gap > 10min entre pings = viaje distinto (mismo trip_id se reutiliza)
 
@@ -153,18 +154,50 @@ def _build_segments(
     return segments
 
 
-def _build_best_trips_map(se: pd.DataFrame) -> dict[str, tuple[str, str]]:
-    """route_short_name → (trip_id, vehicle_id) con MÁS PINGS en stop_events.
+def _traveled_m(group: pd.DataFrame) -> float:
+    """Suma de distancias haversine entre pings consecutivos (ordenados por timestamp)."""
+    g = group.sort_values("timestamp")
+    lats = g["lat"].values
+    lons = g["lon"].values
+    if len(lats) < 2:
+        return 0.0
+    return float(sum(
+        haversine_m(lats[i], lons[i], lats[i + 1], lons[i + 1])
+        for i in range(len(lats) - 1)
+    ))
 
-    Un trip_id GTFS se ejecuta múltiples veces (diferentes vehículos). Para una
-    trace coherente, filtramos por un único vehicle_id que tenga más pings.
+
+def _build_best_trips_map(se: pd.DataFrame) -> dict[str, tuple[str, str]]:
+    """route_short_name → (trip_id, vehicle_id) del mejor viaje físico observado.
+
+    Un trip_id GTFS identifica un viaje "ideal" que se ejecuta múltiples veces
+    por diferentes vehículos. Para una trace coherente necesitamos aislar UN
+    viaje físico (un solo vehicle_id).
+
+    Criterio: de todas las combinaciones (trip_id, vehicle_id) que recorrieron
+    al menos MIN_TRAVELED_M metros (descarta vehículos parados / en garage que
+    acumulan muchos pings sin moverse), elegir la de MÁS pings (mayor densidad
+    → mejor resolución de la trace).
     """
-    counts = se.dropna(subset=["route_short_name", "trip_id", "vehicle_id", "lat", "lon"]).groupby(
-        ["route_short_name", "trip_id", "vehicle_id"]
-    ).size().reset_index(name="n")
-    counts = counts[counts["n"] >= MIN_PINGS_PER_TRIP]
-    if counts.empty:
+    grouped = se.dropna(subset=["route_short_name", "trip_id", "vehicle_id", "lat", "lon"]).groupby(
+        ["route_short_name", "trip_id", "vehicle_id"], sort=False
+    )
+
+    records = []
+    for (route, trip_id, vehicle_id), g in grouped:
+        n = len(g)
+        if n < MIN_PINGS_PER_TRIP:
+            continue
+        tm = _traveled_m(g)
+        if tm < MIN_TRAVELED_M:
+            continue  # vehículo parado o viaje trivial
+        records.append({"route_short_name": route, "trip_id": trip_id,
+                        "vehicle_id": vehicle_id, "n": n, "traveled_m": tm})
+
+    if not records:
         return {}
+    counts = pd.DataFrame(records)
+    # De los viajes físicos con suficiente recorrido, el de mayor densidad (más pings)
     idx = counts.groupby("route_short_name")["n"].idxmax()
     best = counts.loc[idx]
     return {row["route_short_name"]: (row["trip_id"], row["vehicle_id"]) for _, row in best.iterrows()}
@@ -255,6 +288,7 @@ def main() -> None:
         payload = {
             "route": str(route),
             "trip_id": str(trip_id),
+            "vehicle_id": str(vehicle_id),
             "n_pings": int(len(pings)),
             "n_points": len(points),
             "n_segments": len(segments),
