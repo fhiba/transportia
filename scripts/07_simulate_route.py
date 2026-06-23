@@ -42,9 +42,29 @@ def load_worst_route(sf: pd.DataFrame, route_scores_path: Path = None):
     return sf[(sf["route_short_name"] == worst_route) & sf["stop_A_lat"].notna()], worst_route
 
 
+def _haversine_vec(lat1, lon1, lat2, lon2):
+    """Haversine vectorizada con numpy (acepta Series/arrays)."""
+    R = 6_371_000
+    lat1, lon1, lat2, lon2 = np.radians([lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+
 def build_route_data(r_data: pd.DataFrame):
     best_trip = r_data.groupby("trip_id").size().sort_values(ascending=False).index[0]
-    trip_data = r_data[r_data["trip_id"] == best_trip]
+    trip_data = r_data[r_data["trip_id"] == best_trip].copy()
+    # Llenar distance_m faltante con haversine(stop_A, stop_B). Algunas líneas
+    # (ej: NORTE18, 47A) tienen ~99% NaN y sin esto el heatmap queda vacío.
+    nan_mask = trip_data["distance_m"].isna() & trip_data["stop_B_lat"].notna()
+    if nan_mask.any():
+        trip_data.loc[nan_mask, "distance_m"] = _haversine_vec(
+            trip_data.loc[nan_mask, "stop_A_lat"],
+            trip_data.loc[nan_mask, "stop_A_lon"],
+            trip_data.loc[nan_mask, "stop_B_lat"],
+            trip_data.loc[nan_mask, "stop_B_lon"],
+        )
     # reset_index() (sin drop=True) preserva arrival_seq como columna — útil para mergear
     # stops_seq con seg_stats aun cuando falten segmentos consecutivos.
     stops_seq = trip_data.groupby("arrival_seq").agg(

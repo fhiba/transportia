@@ -167,24 +167,36 @@ def _traveled_m(group: pd.DataFrame) -> float:
     ))
 
 
-def _build_best_trips_map(se: pd.DataFrame) -> dict[str, tuple[str, str]]:
+def _build_best_trips_map(
+    se: pd.DataFrame, sf_best_trips: dict[str, str]
+) -> dict[str, tuple[str, str]]:
     """route_short_name → (trip_id, vehicle_id) del mejor viaje físico observado.
 
-    Un trip_id GTFS identifica un viaje "ideal" que se ejecuta múltiples veces
-    por diferentes vehículos. Para una trace coherente necesitamos aislar UN
-    viaje físico (un solo vehicle_id).
+    Para garantizar consistencia espacial con las paradas (que provienen del
+    ``best_trip`` de ``build_route_data``), aquí forzamos el MISMO trip_id que
+    usa aquella función (trip_id con más segmentos en ``segments_features``).
 
-    Criterio: de todas las combinaciones (trip_id, vehicle_id) que recorrieron
-    al menos MIN_TRAVELED_M metros (descarta vehículos parados / en garage que
-    acumulan muchos pings sin moverse), elegir la de MÁS pings (mayor densidad
-    → mejor resolución de la trace).
+    Para ese trip_id, elegimos el ``vehicle_id`` con más pings entre los que
+    recorrieron al menos ``MIN_TRAVELED_M`` metros (descarta vehículos parados
+    / en garage que acumulan muchos pings sin moverse).
     """
-    grouped = se.dropna(subset=["route_short_name", "trip_id", "vehicle_id", "lat", "lon"]).groupby(
-        ["route_short_name", "trip_id", "vehicle_id"], sort=False
-    )
+    sf_best_set = set(sf_best_trips.items())  # {(route, trip_id)}
+    if not sf_best_set:
+        return {}
+
+    se = se.dropna(subset=["route_short_name", "trip_id", "vehicle_id", "lat", "lon"])
+    # Quedarse solo con los pings del best_trip de cada route
+    mask = pd.Series(False, index=se.index)
+    for route, trip_id in sf_best_set:
+        mask |= (se["route_short_name"] == route) & (se["trip_id"] == trip_id)
+    se_b = se[mask]
+    if se_b.empty:
+        return {}
 
     records = []
-    for (route, trip_id, vehicle_id), g in grouped:
+    for (route, trip_id, vehicle_id), g in se_b.groupby(
+        ["route_short_name", "trip_id", "vehicle_id"], sort=False
+    ):
         n = len(g)
         if n < MIN_PINGS_PER_TRIP:
             continue
@@ -197,7 +209,7 @@ def _build_best_trips_map(se: pd.DataFrame) -> dict[str, tuple[str, str]]:
     if not records:
         return {}
     counts = pd.DataFrame(records)
-    # De los viajes físicos con suficiente recorrido, el de mayor densidad (más pings)
+    # Para cada route, el vehicle_id con más pings (mayor densidad)
     idx = counts.groupby("route_short_name")["n"].idxmax()
     best = counts.loc[idx]
     return {row["route_short_name"]: (row["trip_id"], row["vehicle_id"]) for _, row in best.iterrows()}
@@ -215,10 +227,21 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     force = "--force" in sys.argv
 
-    print("Cargando segments_features.parquet para lista de rutas...")
-    sf = pd.read_parquet(sf_path, columns=["route_short_name"])
+    print("Cargando segments_features.parquet para best_trip por ruta...")
+    sf = pd.read_parquet(sf_path, columns=["route_short_name", "trip_id", "stop_A_lat"])
     sf_routes = set(sf["route_short_name"].dropna().unique())
     print(f"  {len(sf_routes)} rutas en segments_features")
+
+    # best_trip por route = trip_id con MÁS segmentos con stop_A_lat válido.
+    # Debe ser el MISMO criterio que build_route_data (scripts/07_simulate_route.py)
+    # para que la trace observada y las stops_seq compartan variante/corredor.
+    sf_valid = sf[sf["stop_A_lat"].notna()]
+    sf_best_trips: dict[str, str] = (
+        sf_valid.groupby("route_short_name")["trip_id"]
+        .agg(lambda s: s.value_counts().index[0])
+        .to_dict()
+    )
+    print(f"  {len(sf_best_trips)} rutas con best_trip determinado")
 
     print("Cargando stop_events.parquet (puede tardar)...")
     t0 = time.monotonic()
@@ -256,7 +279,7 @@ def main() -> None:
     se = se.dropna(subset=["vehicle_id"])
     print(f"  {len(se):,} pings tras filtrar a {len(sf_routes)} rutas")
 
-    best_trips = _build_best_trips_map(se)
+    best_trips = _build_best_trips_map(se, sf_best_trips)
     if args:
         best_trips = {r: t for r, t in best_trips.items() if r in args}
     print(f"\nGenerando traces para {len(best_trips)} líneas...")

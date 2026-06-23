@@ -166,6 +166,53 @@ _GRAPH_INPUTS, _SHAPE_LOOKUP, _TRIP_SHAPE = _build_precomputed()
 _OBSERVED_TRACES = _load_observed_traces()
 
 
+# Coherencia espacial: descarta líneas donde la trace observada y las paradas
+# están en corredores distintos (variante distinta del mismo route_short_name).
+MAX_TRACE_STOP_GAP_KM = 3.0
+
+
+def _compute_valid_lines() -> set[str]:
+    """Set de route_short_name cuyo recorrido, paradas y heatmap son coherentes.
+
+    Criterio (excluye si NO pasa cualquiera):
+      - Trace observada (si existe) a >3km del centroide de paradas ⇒ variante
+        geográfica distinta del mismo route_short_name.
+      - Heatmap vacío tras ``build_route_data`` ⇒ datos pobres (travel_time o
+        distance mayoritariamente NaN).
+    """
+    if _SF is None:
+        return set()
+
+    valid: set[str] = set()
+    for route, grp in _SF[_SF["stop_A_lat"].notna()].groupby("route_short_name"):
+        if grp.empty:
+            continue
+        best_trip = grp.groupby("trip_id").size().sort_values(ascending=False).index[0]
+        trip = grp[grp["trip_id"] == best_trip]
+        # cond 1: centroide de paradas
+        s_c = (float(trip["stop_A_lat"].mean()), float(trip["stop_A_lon"].mean()))
+        trace = _OBSERVED_TRACES.get(str(route))
+        if trace and len(trace.get("points", [])) >= 2:
+            obs_pts = trace["points"]
+            obs_c = (
+                sum(p[0] for p in obs_pts) / len(obs_pts),
+                sum(p[1] for p in obs_pts) / len(obs_pts),
+            )
+            if haversine_m(obs_c[0], obs_c[1], s_c[0], s_c[1]) / 1000 > MAX_TRACE_STOP_GAP_KM:
+                continue  # variante geográfica distinta
+        # cond 2: heatmap viable (travel_time + distance con datos)
+        _, seg_stats = build_route_data(grp)
+        if seg_stats.empty:
+            continue
+        if seg_stats["med_tt"].isna().all() or (seg_stats["med_tt"].fillna(0) <= 0).all():
+            continue  # sin tiempos observados ⇒ heatmap vacío
+        valid.add(str(route))
+    return valid
+
+
+_VALID_LINES = _compute_valid_lines()
+
+
 def data_ready() -> bool:
     return _SF is not None
 
@@ -230,6 +277,8 @@ def list_available_lines() -> list[dict]:
 
     out = []
     for route, row in available.iterrows():
+        if _VALID_LINES and str(route) not in _VALID_LINES:
+            continue  # línea incoherente (variante distinta / datos pobres)
         out.append({
             "route_short_name": str(route),
             "efficiency_score": float(row.get("efficiency_score", 0.0)),
